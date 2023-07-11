@@ -3,6 +3,7 @@ import sys
 import math
 import numpy as np
 import argparse
+import multiprocessing
 from time import perf_counter
 
 def all_rotations(polycube):
@@ -94,6 +95,22 @@ def expand_cube(cube):
         new_cube[x,y,z] = 1
         yield crop_cube(new_cube)
 
+def task(base_cubes):
+    # Empty list of new n-polycubes
+    polycubes = {}
+    polycubes_rle = set()
+
+    for idx, base_cube in enumerate(base_cubes):
+        # Iterate over possible expansion positions
+        for new_cube in expand_cube(base_cube):
+            exists, cube_hash = cube_exists_rle(new_cube, polycubes_rle)
+            if not exists:
+                polycubes[cube_hash] = new_cube
+                polycubes_rle.add(cube_hash)
+
+    return polycubes
+
+
 def generate_polycubes(n, use_cache=False):
     """
     Generates all polycubes of size n
@@ -124,30 +141,28 @@ def generate_polycubes(n, use_cache=False):
         print(f"{len(polycubes)} shapes")
         return polycubes
 
-    # Empty list of new n-polycubes
-    polycubes = []
-    polycubes_rle = set()
-
     base_cubes = generate_polycubes(n-1, use_cache)
 
-    for idx, base_cube in enumerate(base_cubes):
-        # Iterate over possible expansion positions
-        for new_cube in expand_cube(base_cube):
-            if not cube_exists_rle(new_cube, polycubes_rle):
-                polycubes.append(new_cube)
-                polycubes_rle.add(rle(new_cube))
+    cores = multiprocessing.cpu_count()
+    chunk_size = math.ceil(len(base_cubes) / cores)
+    pool = multiprocessing.Pool(cores)
+    chunks = []
+    for chunk_base in range(0, len(base_cubes), chunk_size):
+        chunks.append(base_cubes[chunk_base: min( chunk_base + chunk_size, len(base_cubes))])
+    results = pool.map(task, chunks)
 
-        if (idx % 100 == 0):               
-            perc = round((idx / len(base_cubes)) * 100,2)
-            print(f"\rGenerating polycubes n={n}: {perc}%", end="")
+    final_result = {}
+    for result in results:
+        for cube_hash, cube in result.items():
+            final_result[cube_hash] = cube
 
-    print(f"\rGenerating polycubes n={n}: 100%   ")
+    print(f"Generated polycubes n={n}:")
     
     if use_cache:
         cache_path = f"cubes_{n}.npy"
-        np.save(cache_path, np.array(polycubes, dtype=object), allow_pickle=True)
+        np.save(cache_path, np.array(list(final_result.values()), dtype=object), allow_pickle=True)
 
-    return polycubes
+    return list(final_result.values())
 
 def rle(polycube):
     """
@@ -185,13 +200,15 @@ def cube_exists_rle(polycube, polycubes_rle):
   
     Returns:
     boolean: True if polycube is already present in the set of all cubes so far.
+    hash: the hash for this cube
   
     """
+    max_hash = 0
     for cube_rotation in all_rotations(polycube):
-        if rle(cube_rotation) in polycubes_rle:
-            return True
-
-    return False
+        this_hash = rle(cube_rotation)
+        if(this_hash > max_hash):
+            max_hash = this_hash
+    return max_hash in polycubes_rle, max_hash
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
