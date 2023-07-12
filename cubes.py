@@ -1,8 +1,9 @@
 import os
-import sys
 import math
 import numpy as np
 import argparse
+import multiprocessing
+import matplotlib.pyplot as plt
 from time import perf_counter
 
 def all_rotations(polycube):
@@ -54,12 +55,10 @@ def crop_cube(cube):
   
     """
     for i in range(cube.ndim):
-        cube = np.swapaxes(cube, 0, i)  # send i-th axis to front
-        while np.all( cube[0]==0 ):
-            cube = cube[1:]
-        while np.all( cube[-1]==0 ):
-            cube = cube[:-1]
-        cube = np.swapaxes(cube, 0, i)  # send i-th axis to its original position
+        cube = np.swapaxes(cube, 0, i)
+        nonzero_indices = np.any(cube != 0, axis=tuple(range(1, cube.ndim)))
+        cube = cube[nonzero_indices]
+        cube = np.swapaxes(cube, 0, i)
     return cube
 
 def expand_cube(cube):
@@ -94,7 +93,43 @@ def expand_cube(cube):
         new_cube[x,y,z] = 1
         yield crop_cube(new_cube)
 
-def generate_polycubes(n, use_cache=False):
+def unpack_hashes_task(args):
+    cube_hashes, logging_queue = args
+    return [unpack(cube_hash) for cube_hash in cube_hashes]
+
+
+def hash_cubes_task(args):
+    base_cubes, logging_queue = args
+    # Empty list of new n-polycubes
+    polycubes = set()
+    uid = os.getpid()
+
+    n = 0
+    for base_cube in base_cubes:
+        for new_cube in expand_cube(base_cube):
+            cube_hash = get_canoincal_packing(new_cube)
+            polycubes.add(cube_hash)
+        if(n%1000 == 0):
+            logging_queue.put((uid, n, len(base_cubes)))
+        n += 1
+
+    return polycubes
+
+def dispatch_tasks(task_function, items, logging_queue):
+    if(True):
+        cores = multiprocessing.cpu_count()
+        chunk_size = math.ceil(len(items) / cores)
+
+        chunks = []
+        for chunk_base in range(0, len(items), chunk_size):
+            chunks.append((items[chunk_base: min( chunk_base + chunk_size, len(items))], logging_queue))
+        items = None
+        pool = multiprocessing.Pool(cores)
+        return pool.map(task_function, chunks)
+    else:
+        return [task_function(items)]
+
+def generate_polycubes(n, use_cache=False, logging_queue=None):
     """
     Generates all polycubes of size n
   
@@ -124,37 +159,34 @@ def generate_polycubes(n, use_cache=False):
         print(f"{len(polycubes)} shapes")
         return polycubes
 
-    # Empty list of new n-polycubes
-    polycubes = []
-    polycubes_rle = set()
+    results = dispatch_tasks(hash_cubes_task, generate_polycubes(n-1, use_cache, logging_queue), logging_queue)
 
-    base_cubes = generate_polycubes(n-1, use_cache)
+    final_result = set()
+    for result in results:
+        final_result |= result
+    final_result = list(final_result)
 
-    for idx, base_cube in enumerate(base_cubes):
-        # Iterate over possible expansion positions
-        for new_cube in expand_cube(base_cube):
-            if not cube_exists_rle(new_cube, polycubes_rle):
-                polycubes.append(new_cube)
-                polycubes_rle.add(rle(new_cube))
+    print(f"Hashed polycubes n={n}")
 
-        if (idx % 100 == 0):               
-            perc = round((idx / len(base_cubes)) * 100,2)
-            print(f"\rGenerating polycubes n={n}: {perc}%", end="")
+    results = dispatch_tasks(unpack_hashes_task, final_result, logging_queue)
 
-    print(f"\rGenerating polycubes n={n}: 100%   ")
+    final_result = []
+    for result in results:
+        final_result += result
+
+    print(f"Generated polycubes n={n}")
     
     if use_cache:
         cache_path = f"cubes_{n}.npy"
-        np.save(cache_path, np.array(polycubes, dtype=object), allow_pickle=True)
+        np.save(cache_path, np.array(final_result, dtype=object), allow_pickle=True)
+        print(f"Wrote file for polycubes n={n}")
 
-    return polycubes
+    return final_result
 
-def rle(polycube):
+def pack(polycube: np.ndarray):
     """
-    Computes a simple hash of a given polycube.
-    It does this by converting the polycube into a 1d array and then interpreting those bits as a unsigned integer
-    This function allows cubes to be more quickly compared via hashing.
-  
+    Converts a 3D ndarray into a single unsigned integer for quick hashing and efficient storage
+
     Converts a {0,1} nd array into a single unique large integer
   
     Parameters:
@@ -165,15 +197,40 @@ def rle(polycube):
 
     """
 
-    pack_cube = np.packbits(polycube.flatten())
-    data = 0
+    pack_cube = np.packbits(polycube.flatten(), bitorder='big')
+    cube_hash = 0
+    for index in polycube.shape:
+        cube_hash = (cube_hash << 8) + int(index)
     for part in pack_cube:
-        data = (data << 8) + int(part)
-    out = (data * 100000000) + (polycube.shape[0] * 100000) + (polycube.shape[1] * 100) + (polycube.shape[2]) # add volume dimensions to lower bits of hash
-    return out
+        cube_hash = (cube_hash << 8) + int(part)
+    return cube_hash
+
+def unpack(cube_hash):
+    """
+    Converts a single integer back into a 3D ndarray
 
 
-def cube_exists_rle(polycube, polycubes_rle):
+    Parameters:
+    cube_hash (int): a unique integer hash
+  
+    Returns:
+    np.array: 3D Numpy byte array where 1 values indicate polycube positions
+
+    """
+    parts = []
+    while(cube_hash):
+        parts.append(cube_hash%256)
+        cube_hash >>= 8
+    parts = parts[::-1]
+    shape = (parts[0],parts[1],parts[2])
+    data = parts[3:]
+    size = shape[0] * shape[1] * shape[2]
+    raw = np.unpackbits(np.array(data, dtype=np.uint8), bitorder='big')
+    final =  raw[0:size].reshape(shape)
+    return final
+
+
+def get_canoincal_packing(polycube):
     """
     Determines if a polycube has already been seen.
   
@@ -185,44 +242,18 @@ def cube_exists_rle(polycube, polycubes_rle):
   
     Returns:
     boolean: True if polycube is already present in the set of all cubes so far.
+    hash: the hash for this cube
   
     """
+    max_hash = 0
     for cube_rotation in all_rotations(polycube):
-        if rle(cube_rotation) in polycubes_rle:
-            return True
+        this_hash = pack(cube_rotation)
+        if(this_hash > max_hash):
+            max_hash = this_hash
+    return max_hash
 
-    return False
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-                    prog='Polycube Generator',
-                    description='Generates all polycubes (combinations of cubes) of size n.')
-
-    parser.add_argument('n', metavar='N', type=int,
-                    help='The number of cubes within each polycube')
-    
-    #Requires python >=3.9
-    parser.add_argument('--cache', action=argparse.BooleanOptionalAction)
-
-    args = parser.parse_args()
-   
-    n = args.n
-    use_cache = args.cache if args.cache is not None else True
-
-    # Start the timer
-    t1_start = perf_counter()
-
-    all_cubes = list(generate_polycubes(n, use_cache=use_cache))
-
-    # Stop the timer
-    t1_stop = perf_counter()
-
-    print (f"Found {len(all_cubes)} unique polycubes")
-    print (f"Elapsed time: {round(t1_stop - t1_start,3)}s")
-
-
-# Code for if you want to generate pictures of the sets of cubes. Will work up to about n=8, before there are simply too many!
-# Could be adapted for larger cube sizes by splitting the dataset up into separate images.
+# # Code for if you want to generate pictures of the sets of cubes. Will work up to about n=8, before there are simply too many!
+# # Could be adapted for larger cube sizes by splitting the dataset up into separate images.
 # def render_shapes(shapes, path):
 #     n = len(shapes)
 #     dim = max(max(a.shape) for a in shapes)
@@ -238,7 +269,7 @@ if __name__ == "__main__":
 #         s = shape.shape
 #         voxel_array[x:x + s[0], y:y + s[1] , 0 : s[2]] = shape
 
-#     voxel_array = crop_cube(voxel_array)
+#     #voxel_array = crop_cube(voxel_array)
 #     colors = np.empty(voxel_array.shape, dtype=object)
 #     colors[:] = '#FFD65DC0'
 
@@ -251,3 +282,54 @@ if __name__ == "__main__":
 #     plt.axis("off")
 #     ax.set_box_aspect((1, 1, voxel_array.shape[2] / voxel_array.shape[0]))
 #     plt.savefig(path + ".png", bbox_inches='tight', pad_inches = 0)
+
+def logging_task(queue):
+    status = {}
+    while True:
+        (uid, done, total) = queue.get()
+        status[uid] = (done, total)
+
+        total_done = 0
+        total_total = 0
+        for uid, (done, total) in status.items():
+            total_done += done
+            total_total += total
+
+        print(f'\rCompleted {total_done} of {total_total} {((total_done/total_total) * 100):.2f}%', end="")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+                    prog='Polycube Generator',
+                    description='Generates all polycubes (combinations of cubes) of size n.')
+
+    parser.add_argument('n', metavar='N', type=int,
+                    help='The number of cubes within each polycube')
+    
+    #Requires python >=3.9
+    parser.add_argument('--cache', action=argparse.BooleanOptionalAction)
+
+    args = parser.parse_args()
+
+    n = args.n
+    use_cache = args.cache if args.cache is not None else True
+
+    with multiprocessing.Manager() as Manager:
+        logging_queue = Manager.Queue()
+        logging_process = multiprocessing.Process(target=logging_task, args=[logging_queue])
+        logging_process.daemon = True
+        logging_process.start()
+
+        # Start the timer
+        t1_start = perf_counter()
+
+        all_cubes = list(generate_polycubes(n, use_cache=use_cache, logging_queue=logging_queue))
+
+        # Stop the timer
+        t1_stop = perf_counter()
+
+        # padded = [np.pad(shape, 1, constant_values=0) for shape in all_cubes]
+            
+        # render_shapes(padded, "./out")
+
+        print (f"\nFound {len(all_cubes)} unique polycubes")
+        print (f"\nElapsed time: {round(t1_stop - t1_start,3)}s")
